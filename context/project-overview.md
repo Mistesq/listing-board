@@ -134,6 +134,7 @@ See Commands in `CLAUDE.md`. `go test ./...` uses an in-memory fake store and `t
 - `STEP_PAUSE`: unset means `2s`, `0` is allowed, an unparsable or negative value makes the worker exit at startup with a clear error. Alt: fall back to `2s`.
 - Check order on id routes: 401, then 404 (unknown or another account's sheet), then route checks. For start: 400 without a brochure, then status logic, then 409.
 - Error texts not fixed by README: existing texts in the code stay as they are (missing `file` field `Choose a brochure file`, wrong or empty type `Brochure must be a PDF or a text file`, oversized file `Brochure is too large`, broken multipart `Brochure upload was incomplete`, disk/store failure `Could not store the brochure`). New texts only for new cases: 409 on start `Another sheet is already running`; second upload `A brochure is already attached`.
+- Filename check: a client filename that is not valid UTF-8 or is longer than 255 bytes (after trimming spaces) gives 400 `Brochure file name is not valid`, checked before anything is written under `DATA_DIR`, so Postgres never sees it and no orphan `body` is left. Alt: reuse `Choose a brochure file`.
 
 ## Open Questions
 

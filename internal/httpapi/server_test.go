@@ -59,12 +59,27 @@ func TestStartMarksTheJobSuccessful(t *testing.T) {
 func TestUploadKeepsTheClientFilename(t *testing.T) {
 	srv, dir := newTestServer(t)
 	cookie := signUp(t, srv, "ada@example.com")
+	userID := currentUserID(t, srv, cookie)
 	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
-	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	data := []byte("Two bedrooms, south facing.\n")
+	got := uploadFile(t, srv, cookie, job.ID, "../../escaped.txt", data, "text/plain")
 
-	path := filepath.Join(dir, job.ID, "brochure.pdf")
-	if _, err := os.Stat(path); err != nil {
+	if got.Filename != "../../escaped.txt" {
+		t.Fatalf("filename %q, want the client name ../../escaped.txt", got.Filename)
+	}
+	path := filepath.Join(dir, userID, job.ID, "body")
+	stored, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatalf("brochure was not stored at %s: %v", path, err)
+	}
+	if !bytes.Equal(stored, data) {
+		t.Fatalf("stored %q, want %q", stored, data)
+	}
+	if files := filesUnder(t, dir); len(files) != 1 || files[0] != path {
+		t.Fatalf("files under DATA_DIR %v, want only %s", files, path)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "escaped.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a file escaped DATA_DIR: %v", err)
 	}
 }
 
@@ -333,6 +348,180 @@ func TestUploadChecksTheOwnerBeforeReadingTheBody(t *testing.T) {
 	}
 }
 
+func TestUploadDecidesTheBrochureFromTheBytes(t *testing.T) {
+	cases := []struct {
+		name        string
+		filename    string
+		contentType string
+		data        []byte
+		want        string
+	}{
+		{"pdf", "brochure.pdf", "application/pdf", []byte("%PDF-1.4\n%binary\n"), ""},
+		{"text", "brochure.txt", "text/plain", []byte("Two bedrooms, south facing.\n"), ""},
+		{"utf-8 text", "brochure.txt", "text/plain", []byte("Дві спальні, вид на південь.\n"), ""},
+		{"%PDF- inside a txt name", "notes.txt", "text/plain", []byte("The plan says %PDF-1.4 in the middle.\n"), ""},
+		{"pdf bytes sent as text/plain", "brochure.pdf", "text/plain", []byte("%PDF-1.7\n"), ""},
+		{"exactly 1 MiB", "big.txt", "text/plain", bytes.Repeat([]byte("a"), 1048576), ""},
+		{"file name of 255 bytes", strings.Repeat("a", 251) + ".txt", "text/plain", []byte("Two bedrooms\n"), ""},
+		{"file name of 256 bytes", strings.Repeat("a", 252) + ".txt", "text/plain", []byte("Two bedrooms\n"), "Brochure file name is not valid"},
+		{"file name not valid utf-8", "\xff.txt", "text/plain", []byte("Two bedrooms\n"), "Brochure file name is not valid"},
+		{"empty", "brochure.txt", "text/plain", nil, "Brochure must be a PDF or a text file"},
+		{"nul byte", "brochure.txt", "text/plain", []byte("Two\x00bedrooms"), "Brochure must be a PDF or a text file"},
+		{"invalid utf-8", "brochure.txt", "text/plain", []byte("Two \xff\xfe bedrooms"), "Brochure must be a PDF or a text file"},
+		{"jpeg bytes named and typed as pdf", "brochure.pdf", "application/pdf", []byte("\xff\xd8\xff\xe0JFIF"), "Brochure must be a PDF or a text file"},
+		{"one byte over 1 MiB", "big.txt", "text/plain", bytes.Repeat([]byte("a"), 1048577), "Brochure is too large"},
+		{"one byte over 1 MiB of a wrong type", "big.bin", "application/octet-stream", make([]byte, 1048577), "Brochure is too large"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, dir := newTestServer(t)
+			cookie := signUp(t, srv, "ada@example.com")
+			userID := currentUserID(t, srv, cookie)
+			job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+			res := postFile(t, srv, cookie, job.ID, tc.filename, tc.data, tc.contentType)
+			if tc.want != "" {
+				if res.Code != http.StatusBadRequest {
+					t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+				}
+				if got := decodeError(t, res); got != tc.want {
+					t.Fatalf("error %q, want %q", got, tc.want)
+				}
+				assertEmptyDir(t, dir)
+				return
+			}
+			if res.Code != http.StatusOK {
+				t.Fatalf("status %d, want 200: %s", res.Code, res.Body.String())
+			}
+			if got := decodeJob(t, res); got.Filename != tc.filename {
+				t.Fatalf("filename %q, want %q", got.Filename, tc.filename)
+			}
+			stored, err := os.ReadFile(filepath.Join(dir, userID, job.ID, "body"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(stored, tc.data) {
+				t.Fatalf("stored %d bytes, want the %d uploaded", len(stored), len(tc.data))
+			}
+		})
+	}
+}
+
+func TestUploadRejectsABrokenForm(t *testing.T) {
+	file := formPart{disposition: `form-data; name="file"; filename="brochure.txt"`, data: []byte("Two bedrooms\n")}
+	cases := []struct {
+		name string
+		body func(t *testing.T) (io.Reader, string)
+		want string
+	}{
+		{"no file part", func(t *testing.T) (io.Reader, string) {
+			return multipartBody(t, formPart{disposition: `form-data; name="notes"`, data: []byte("hi")})
+		}, "Choose a brochure file"},
+		{"file part without a filename", func(t *testing.T) (io.Reader, string) {
+			return multipartBody(t, formPart{disposition: `form-data; name="file"`, data: []byte("Two bedrooms\n")})
+		}, "Choose a brochure file"},
+		{"blank filename", func(t *testing.T) (io.Reader, string) {
+			return multipartBody(t, formPart{disposition: `form-data; name="file"; filename="  "`, data: []byte("Two bedrooms\n")})
+		}, "Choose a brochure file"},
+		{"cut before the closing boundary", func(t *testing.T) (io.Reader, string) {
+			buf, formType := multipartBody(t, file)
+			raw := buf.Bytes()
+			return bytes.NewReader(raw[:bytes.LastIndex(raw, []byte("\r\n--"))]), formType
+		}, "Brochure upload was incomplete"},
+		{"not multipart", func(t *testing.T) (io.Reader, string) {
+			return strings.NewReader("Two bedrooms\n"), "text/plain"
+		}, "Brochure upload was incomplete"},
+		{"request body over the limit before the file", func(t *testing.T) (io.Reader, string) {
+			return multipartBody(t, formPart{disposition: `form-data; name="notes"`, data: bytes.Repeat([]byte("a"), 2<<20)}, file)
+		}, "Brochure is too large"},
+		{"request body over the limit inside a 1 MiB file", func(t *testing.T) (io.Reader, string) {
+			return multipartBody(t,
+				formPart{disposition: `form-data; name="notes"`, data: bytes.Repeat([]byte("a"), 100<<10)},
+				formPart{disposition: `form-data; name="file"; filename="big.txt"`, data: bytes.Repeat([]byte("a"), 1048576)},
+			)
+		}, "Brochure is too large"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, dir := newTestServer(t)
+			cookie := signUp(t, srv, "ada@example.com")
+			job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+			body, formType := tc.body(t)
+			res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/file", cookie, body, formType)
+			if res.Code != http.StatusBadRequest {
+				t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+			}
+			if got := decodeError(t, res); got != tc.want {
+				t.Fatalf("error %q, want %q", got, tc.want)
+			}
+			assertEmptyDir(t, dir)
+		})
+	}
+}
+
+func TestUploadTakesTheFirstFilePart(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	userID := currentUserID(t, srv, cookie)
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	body, formType := multipartBody(t,
+		formPart{disposition: `form-data; name="notes"`, data: []byte("call before visiting")},
+		formPart{disposition: `form-data; name="file"; filename="first.txt"`, data: []byte("First brochure\n")},
+		formPart{disposition: `form-data; name="file"; filename="second.txt"`, data: []byte("Second brochure\n")},
+	)
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/file", cookie, body, formType)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	if got := decodeJob(t, res); got.Filename != "first.txt" {
+		t.Fatalf("filename %q, want first.txt", got.Filename)
+	}
+	stored, err := os.ReadFile(filepath.Join(dir, userID, job.ID, "body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stored) != "First brochure\n" {
+		t.Fatalf("stored %q, want the first file part", stored)
+	}
+}
+
+func TestDownloadReturnsTheStoredBrochure(t *testing.T) {
+	cases := []struct {
+		name     string
+		filename string
+		data     []byte
+	}{
+		{"pdf", "brochure.pdf", []byte("%PDF-1.4\n%binary\n")},
+		{"text", "brochure.txt", []byte("Two bedrooms, south facing.\n")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, dir := newTestServer(t)
+			cookie := signUp(t, srv, "ada@example.com")
+			userID := currentUserID(t, srv, cookie)
+			job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+			uploadFile(t, srv, cookie, job.ID, tc.filename, tc.data, "application/octet-stream")
+
+			res := call(srv, http.MethodGet, "/api/jobs/"+job.ID+"/file", cookie, nil, "")
+			if res.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", res.Code, res.Body.String())
+			}
+			if !bytes.Equal(res.Body.Bytes(), tc.data) {
+				t.Fatalf("downloaded %q, want %q", res.Body.Bytes(), tc.data)
+			}
+
+			if err := os.Remove(filepath.Join(dir, userID, job.ID, "body")); err != nil {
+				t.Fatal(err)
+			}
+			if res := call(srv, http.MethodGet, "/api/jobs/"+job.ID+"/file", cookie, nil, ""); res.Code != http.StatusNotFound {
+				t.Fatalf("after removing body: status %d, want 404", res.Code)
+			}
+		})
+	}
+}
+
 type readRecorder struct {
 	r    io.Reader
 	read bool
@@ -386,26 +575,95 @@ func createSheet(t *testing.T, srv *Server, cookie, title, address string) board
 	return decodeJob(t, res)
 }
 
-func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) {
+func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) board.Job {
+	t.Helper()
+	res := postFile(t, srv, cookie, id, name, data, contentType)
+	if res.Code != http.StatusOK {
+		t.Fatalf("upload %d: %s", res.Code, res.Body.String())
+	}
+	return decodeJob(t, res)
+}
+
+func postFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, formType := multipartBody(t, formPart{
+		disposition: fmt.Sprintf(`form-data; name="file"; filename="%s"`, name),
+		contentType: contentType,
+		data:        data,
+	})
+	return call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, body, formType)
+}
+
+type formPart struct {
+	disposition string
+	contentType string
+	data        []byte
+}
+
+func multipartBody(t *testing.T, parts ...formPart) (*bytes.Buffer, string) {
 	t.Helper()
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
-	header := textproto.MIMEHeader{}
-	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, name))
-	header.Set("Content-Type", contentType)
-	part, err := writer.CreatePart(header)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := part.Write(data); err != nil {
-		t.Fatal(err)
+	for _, p := range parts {
+		header := textproto.MIMEHeader{}
+		header.Set("Content-Disposition", p.disposition)
+		if p.contentType != "" {
+			header.Set("Content-Type", p.contentType)
+		}
+		part, err := writer.CreatePart(header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write(p.data); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	res := call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, &buf, writer.FormDataContentType())
+	return &buf, writer.FormDataContentType()
+}
+
+func currentUserID(t *testing.T, srv *Server, cookie string) string {
+	t.Helper()
+	res := call(srv, http.MethodGet, "/api/me", cookie, nil, "")
 	if res.Code != http.StatusOK {
-		t.Fatalf("upload %d: %s", res.Code, res.Body.String())
+		t.Fatalf("me %d: %s", res.Code, res.Body.String())
+	}
+	var me account
+	if err := json.Unmarshal(res.Body.Bytes(), &me); err != nil {
+		t.Fatal(err)
+	}
+	return me.ID
+}
+
+func filesUnder(t *testing.T, dir string) []string {
+	t.Helper()
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+// assertEmptyDir fails unless dir has no entries at all, not even folders.
+func assertEmptyDir(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("DATA_DIR is not empty: %v", entries)
 	}
 }
 

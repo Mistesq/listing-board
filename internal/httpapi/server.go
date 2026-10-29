@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -18,6 +19,9 @@ import (
 )
 
 const sessionCookie = "lb_session"
+
+// maxFilenameBytes caps the stored client filename, which is metadata only.
+const maxFilenameBytes = 255
 
 type Server struct {
 	store   board.Store
@@ -221,36 +225,21 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
+	r.Body = http.MaxBytesReader(w, r.Body, board.MaxBrochureSize+64<<10)
+	name, data, problem := readBrochure(r)
+	if problem != "" {
+		writeErr(w, http.StatusBadRequest, problem)
 		return
 	}
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Choose a brochure file")
-		return
-	}
-	defer file.Close()
-	name := filenameFromHeader(header)
-	if strings.TrimSpace(name) == "" || !headerAllows(name, header.Header.Get("Content-Type")) {
+	if _, ok := board.BrochureType(data); !ok {
 		writeErr(w, http.StatusBadRequest, "Brochure must be a PDF or a text file")
 		return
 	}
-	data, err := io.ReadAll(io.LimitReader(file, 8<<20+1))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
-		return
-	}
-	if len(data) > 8<<20 {
-		writeErr(w, http.StatusBadRequest, "Brochure is too large")
-		return
-	}
-	dir := filepath.Join(s.dataDir, job.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dst := board.BrochurePath(s.dataDir, user.ID, job.ID)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
-	dst := filepath.Join(dir, name)
 	if err := os.WriteFile(dst, data, 0o644); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
@@ -302,7 +291,7 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
-	f, err := os.Open(filepath.Join(s.dataDir, job.ID, job.Filename))
+	f, err := os.Open(board.BrochurePath(s.dataDir, user.ID, job.ID))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
@@ -355,23 +344,58 @@ func (s *Server) openSession(w http.ResponseWriter, r *http.Request, user board.
 	return nil
 }
 
-func filenameFromHeader(header *multipart.FileHeader) string {
-	_, params, err := mime.ParseMediaType(header.Header.Get("Content-Disposition"))
-	if err == nil {
-		if name := strings.TrimSpace(params["filename"]); name != "" {
-			return name
-		}
+// readBrochure streams the first "file" part of the multipart body. On failure
+// it returns the user-facing message instead of the name and bytes.
+func readBrochure(r *http.Request) (string, []byte, string) {
+	reader, err := r.MultipartReader()
+	if err != nil {
+		return "", nil, "Brochure upload was incomplete"
 	}
-	return header.Filename
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			return "", nil, "Choose a brochure file"
+		}
+		if err != nil {
+			return "", nil, uploadProblem(err)
+		}
+		if part.FormName() != "file" {
+			continue
+		}
+		name := partFilename(part)
+		if name == "" {
+			return "", nil, "Choose a brochure file"
+		}
+		if len(name) > maxFilenameBytes || !utf8.ValidString(name) {
+			return "", nil, "Brochure file name is not valid"
+		}
+		data, err := io.ReadAll(io.LimitReader(part, board.MaxBrochureSize+1))
+		if err != nil {
+			return "", nil, uploadProblem(err)
+		}
+		if len(data) > board.MaxBrochureSize {
+			return "", nil, "Brochure is too large"
+		}
+		return name, data, ""
+	}
 }
 
-func headerAllows(name, contentType string) bool {
-	ct := strings.ToLower(contentType)
-	lower := strings.ToLower(name)
-	if strings.Contains(ct, "pdf") || strings.Contains(ct, "text/plain") {
-		return true
+func uploadProblem(err error) string {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		return "Brochure is too large"
 	}
-	return strings.HasSuffix(lower, ".pdf") || strings.HasSuffix(lower, ".txt")
+	return "Brochure upload was incomplete"
+}
+
+// partFilename reads the filename from Content-Disposition as sent.
+// Part.FileName would strip directories, but filename is metadata only.
+func partFilename(part *multipart.Part) string {
+	_, params, err := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(params["filename"])
 }
 
 func decode(w http.ResponseWriter, r *http.Request, dst any) error {

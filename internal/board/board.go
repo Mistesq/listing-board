@@ -1,12 +1,18 @@
 package board
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"path/filepath"
 	"time"
+	"unicode/utf8"
 )
+
+// MaxBrochureSize is the largest brochure accepted, in bytes.
+const MaxBrochureSize = 1 << 20
 
 var (
 	ErrNotFound       = errors.New("not found")
@@ -53,6 +59,25 @@ func NewID() string {
 
 func NewToken() string {
 	return randomHex(32)
+}
+
+// BrochurePath is where a sheet's brochure bytes live. Only server-chosen ids
+// take part in it, never the client's filename.
+func BrochurePath(dataDir, userID, jobID string) string {
+	return filepath.Join(dataDir, userID, jobID, "body")
+}
+
+// BrochureType names the content type of a brochure from its bytes. It
+// reports false for anything that is neither a PDF nor UTF-8 text.
+func BrochureType(data []byte) (string, bool) {
+	switch {
+	case bytes.HasPrefix(data, []byte("%PDF-")):
+		return "application/pdf", true
+	case len(data) == 0, bytes.IndexByte(data, 0) >= 0, !utf8.Valid(data):
+		return "", false
+	default:
+		return "text/plain; charset=utf-8", true
+	}
 }
 
 func randomHex(n int) string {
