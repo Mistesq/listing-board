@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"slices"
 	"sync"
@@ -15,8 +16,8 @@ import (
 	"listingboard/internal/board"
 )
 
-// shared is opened once per package: schema.sql runs without a lock, and
-// concurrent CREATE ... IF NOT EXISTS can race in Postgres.
+// shared is opened once per package, so the schema migration runs once and
+// parallel tests share one connection pool.
 var shared *Store
 
 func TestMain(m *testing.M) {
@@ -464,6 +465,99 @@ func TestIsConstraintTellsUniqueViolationsApart(t *testing.T) {
 	}
 }
 
+func TestMigrateWaitsForTheLock(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockKey); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.migrate() }()
+	select {
+	case err := <-done:
+		t.Fatalf("migrate finished while another transaction held the lock: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("migrate did not finish after the lock was released")
+	}
+}
+
+func TestOpenMigratesAnEmptySchemaConcurrently(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	schema := "test_" + board.NewID()
+	if _, err := s.db.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := s.db.ExecContext(context.Background(), `DROP SCHEMA `+schema+` CASCADE`); err != nil {
+			t.Errorf("drop schema %s: %v", schema, err)
+		}
+	})
+	dsn := withSearchPath(t, os.Getenv("DATABASE_URL"), schema)
+
+	const n = 4
+	errs := make([]error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			st, err := Open(dsn)
+			if err == nil {
+				err = st.Close()
+			}
+			errs[i] = err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("open %d: %v", i, err)
+		}
+	}
+	var tables int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.tables WHERE table_schema = $1
+	`, schema).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 3 {
+		t.Fatalf("tables in %s = %d, want 3", schema, tables)
+	}
+}
+
+// withSearchPath points a URL-style DSN at schema, which pgx sends to Postgres
+// as a runtime parameter.
+func withSearchPath(t *testing.T, dsn, schema string) string {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil || u.Scheme == "" {
+		t.Skip("DATABASE_URL is not a URL")
+	}
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 func openStore(t *testing.T) *Store {
 	t.Helper()
 	if shared == nil {
@@ -479,7 +573,24 @@ func newUser(t *testing.T, s *Store) board.User {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { deleteUser(t, s, user.ID) })
 	return user
+}
+
+// deleteUser removes a test user with its sessions and sheets, so no running
+// sheet without a brochure is left for a live worker to fail.
+func deleteUser(t *testing.T, s *Store, userID string) {
+	t.Helper()
+	for _, query := range []string{
+		`DELETE FROM sessions WHERE user_id = $1`,
+		`DELETE FROM jobs WHERE user_id = $1`,
+		`DELETE FROM users WHERE id = $1`,
+	} {
+		if _, err := s.db.ExecContext(context.Background(), query, userID); err != nil {
+			t.Errorf("clean up user %s: %v", userID, err)
+			return
+		}
+	}
 }
 
 func newDraft(t *testing.T, s *Store, userID string) board.Job {

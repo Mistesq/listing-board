@@ -13,6 +13,10 @@ import (
 	"listingboard/internal/board"
 )
 
+// migrateLockKey serializes schema.sql between the API and the worker, which
+// both run it on start.
+const migrateLockKey int64 = 7290001
+
 type Store struct {
 	db *sql.DB
 }
@@ -44,8 +48,20 @@ func (s *Store) Close() error {
 func (s *Store) migrate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := s.db.ExecContext(ctx, schemaSQL)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockKey); err != nil {
+		return err
+	}
+	// No args: pgx sends schemaSQL over the simple protocol, which runs every
+	// statement in it.
+	if _, err := tx.ExecContext(ctx, schemaSQL); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CreateUser(ctx context.Context, email, passwordHash string) (board.User, error) {
