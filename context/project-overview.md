@@ -53,7 +53,7 @@ Status transitions: `draft -> running` (API, `POST /start`), `running -> success
 ### Upload
 
 - The multipart body is read as a stream (`r.MultipartReader()`), not `ParseMultipartForm`.
-- The file limit is exact: 1048576 bytes pass, 1048577 bytes are 400. The request body limit (`MaxBytesReader`) leaves headroom for the multipart envelope. An oversized file is 400, not 413.
+- The file limit is exact: 1048576 bytes pass, 1048577 bytes are 400. The request body limit (`MaxBytesReader`) leaves headroom for the multipart envelope. An oversized file, including one that trips `MaxBytesReader`, is 400 `Brochure is too large`, not 413.
 - Cheap early check: after ownership and before the body is read, a sheet that already has a `filename` gets 400 `A brochure is already attached`. This is only a shortcut; the conditional `UPDATE` below is the guarantee.
 - Type and size are validated before anything is written under `DATA_DIR`.
 - Write order, so concurrent uploads never overwrite or delete another upload's `body`:
@@ -77,7 +77,7 @@ Status transitions: `draft -> running` (API, `POST /start`), `running -> success
 - The schema migration is safe when API and worker start at the same time: `pg_advisory_lock` (or `pg_advisory_xact_lock` in one transaction) around executing `schema.sql`.
 - Polls `running` sheets, one goroutine per sheet, and tracks sheets already in progress so a sheet is never processed twice by the same process.
 - No pause before the first step. For each step: check the brochure is readable, mark the first `pending` step `done`, save, then wait `STEP_PAUSE`. A `done` step is never redone.
-- Every write is conditional: `WHERE status = 'running' AND run_id = $runId`. A write that changes no row stops processing that sheet.
+- Every write is conditional: `WHERE status = 'running' AND run_id = $runId`. A write that changes no row stops processing that sheet. A DB error while polling or saving is logged and retried on the next tick; the worker keeps running and the sheet stays `running`.
 - On SIGTERM the worker stops without writing anything, so a killed worker leaves the sheet `running`. After a restart it continues from the first `pending` step with the same `runId`.
 - Brochure cannot be read: `status = 'failed'`, `error` is exactly `Brochure is missing`.
 
@@ -98,6 +98,7 @@ Status transitions: `draft -> running` (API, `POST /start`), `running -> success
 - The open sheet and its status in the list update while it is `running`.
 - `error` is shown when the sheet has `failed`.
 - The 409 message from `POST /start` is shown.
+- A failed upload after create still adds the sheet to the list; an open `draft` without a brochure shows a file input to attach one.
 - The `Job` type in `App.tsx` gets `runId`.
 
 ### NOTES.md
@@ -130,7 +131,7 @@ See Commands in `CLAUDE.md`. `go test ./...` uses an in-memory fake store and `t
 - Brochure check: the worker checks the brochure is readable before every step, not only the first. A file lost mid-run fails the sheet. Alt: first step only.
 - Success write: after the third step is saved, the worker sets `success` right away, without a pause, as a separate save. Alt: same write as the third step.
 - Page refresh: the page polls `GET /api/jobs/{id}` about once a second while the open sheet is `running`, and updates the list entry from the response. No SSE. Alt: SSE.
-- `STEP_PAUSE`: unset means `2s`, `0` is allowed, an invalid value makes the worker exit at startup with a clear error. Alt: fall back to `2s`.
+- `STEP_PAUSE`: unset means `2s`, `0` is allowed, an unparsable or negative value makes the worker exit at startup with a clear error. Alt: fall back to `2s`.
 - Check order on id routes: 401, then 404 (unknown or another account's sheet), then route checks. For start: 400 without a brochure, then status logic, then 409.
 - Error texts not fixed by README: existing texts in the code stay as they are (missing `file` field `Choose a brochure file`, wrong or empty type `Brochure must be a PDF or a text file`, oversized file `Brochure is too large`, broken multipart `Brochure upload was incomplete`, disk/store failure `Could not store the brochure`). New texts only for new cases: 409 on start `Another sheet is already running`; second upload `A brochure is already attached`.
 
@@ -140,7 +141,13 @@ None.
 
 ## Roadmap
 
-To be filled by `/specs split`.
+1. `context/features/sheets-phase-1-spec.md`: ownership lookup on every id route, `mem` parity rule. Depends on: none.
+2. `context/features/sheets-phase-2-spec.md`: start draft -> running, partial unique index, 409. Depends on: 1.
+3. `context/features/brochure-phase-1-spec.md`: streamed upload, exact limit, byte type, shared path helper. Depends on: 1.
+4. `context/features/brochure-phase-2-spec.md`: one brochure per sheet (temp, claim, rename), download headers. Depends on: 3.
+5. `context/features/worker-phase-1-spec.md`: `internal/worker` checklist runner with conditional writes. Depends on: 2, 3.
+6. `context/features/worker-phase-2-spec.md`: `cmd/worker`, advisory-locked migration, Dockerfile and compose. Depends on: 5.
+7. `context/features/page-phase-1-spec.md`: page polling, failed error, 409 message, `NOTES.md`. Depends on: 2, 4, 6.
 
 ## Out of scope
 
