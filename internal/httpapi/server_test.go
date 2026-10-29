@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -364,6 +365,8 @@ func TestUploadDecidesTheBrochureFromTheBytes(t *testing.T) {
 		{"exactly 1 MiB", "big.txt", "text/plain", bytes.Repeat([]byte("a"), 1048576), ""},
 		{"file name of 255 bytes", strings.Repeat("a", 251) + ".txt", "text/plain", []byte("Two bedrooms\n"), ""},
 		{"file name of 256 bytes", strings.Repeat("a", 252) + ".txt", "text/plain", []byte("Two bedrooms\n"), "Brochure file name is not valid"},
+		{"file name kept with its spaces", " brochure.txt ", "text/plain", []byte("Two bedrooms\n"), ""},
+		{"file name of 256 raw bytes with a space", " " + strings.Repeat("a", 251) + ".txt", "text/plain", []byte("Two bedrooms\n"), "Brochure file name is not valid"},
 		{"file name not valid utf-8", "\xff.txt", "text/plain", []byte("Two bedrooms\n"), "Brochure file name is not valid"},
 		{"empty", "brochure.txt", "text/plain", nil, "Brochure must be a PDF or a text file"},
 		{"nul byte", "brochure.txt", "text/plain", []byte("Two\x00bedrooms"), "Brochure must be a PDF or a text file"},
@@ -487,6 +490,328 @@ func TestUploadTakesTheFirstFilePart(t *testing.T) {
 	}
 }
 
+func TestAttachRejectsASecondUpload(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	userID := currentUserID(t, srv, cookie)
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, job.ID, "first.txt", []byte("First brochure\n"), "text/plain")
+
+	buf, formType := multipartBody(t, filePart("second.txt", []byte("Second brochure\n")))
+	body := &readRecorder{r: buf}
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/file", cookie, body, formType)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := decodeError(t, res); got != "A brochure is already attached" {
+		t.Fatalf("error %q", got)
+	}
+	if body.read {
+		t.Fatal("the second upload's body was read")
+	}
+	assertBrochure(t, srv, cookie, dir, userID, job.ID, "first.txt", "First brochure\n")
+}
+
+func TestAttachConcurrentUploadsKeepOneBrochure(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	userID := currentUserID(t, srv, cookie)
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	const n = 5
+	release := make(chan struct{})
+	bodies := make([]*gatedBody, n)
+	results := make([]*httptest.ResponseRecorder, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		buf, formType := multipartBody(t, filePart(fmt.Sprintf("brochure-%d.txt", i), []byte(fmt.Sprintf("Brochure %d\n", i))))
+		bodies[i] = newGatedBody(buf.Bytes(), release)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/file", cookie, bodies[i], formType)
+		}()
+	}
+	for _, body := range bodies {
+		body.waitStarted(t)
+	}
+	close(release)
+	wg.Wait()
+
+	winner := -1
+	for i, res := range results {
+		switch {
+		case res.Code == http.StatusOK && winner == -1:
+			winner = i
+		case res.Code == http.StatusOK:
+			t.Fatalf("uploads %d and %d both got 200", winner, i)
+		case res.Code != http.StatusBadRequest || decodeError(t, res) != "A brochure is already attached":
+			t.Fatalf("upload %d: status %d: %s", i, res.Code, res.Body.String())
+		}
+	}
+	if winner == -1 {
+		t.Fatal("no upload got 200")
+	}
+	assertBrochure(t, srv, cookie, dir, userID, job.ID, fmt.Sprintf("brochure-%d.txt", winner), fmt.Sprintf("Brochure %d\n", winner))
+	if files := filesUnder(t, dir); len(files) != 1 {
+		t.Fatalf("files under DATA_DIR %v, want only body", files)
+	}
+}
+
+func TestAttachFailedRenameFreesTheSlot(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	userID := currentUserID(t, srv, cookie)
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	blocker := filepath.Join(dir, userID, job.ID, "body")
+	if err := os.MkdirAll(blocker, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res := postFile(t, srv, cookie, job.ID, "brochure.txt", []byte("Two bedrooms\n"), "text/plain")
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500: %s", res.Code, res.Body.String())
+	}
+	if got := decodeError(t, res); got != "Could not store the brochure" {
+		t.Fatalf("error %q", got)
+	}
+	if got := getSheet(t, srv, cookie, job.ID); got.Filename != "" {
+		t.Fatalf("filename %q, want it reset", got.Filename)
+	}
+	if files := filesUnder(t, dir); len(files) != 0 {
+		t.Fatalf("files left under DATA_DIR: %v", files)
+	}
+
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	uploadFile(t, srv, cookie, job.ID, "brochure.txt", []byte("Two bedrooms\n"), "text/plain")
+}
+
+func TestAttachStoreFailureLeavesNoFile(t *testing.T) {
+	cases := []struct {
+		name        string
+		store       func(*mem) board.Store
+		blockRename bool
+	}{
+		{"claim fails", func(m *mem) board.Store { return failingAttach{m} }, false},
+		{"rename and reset both fail", func(m *mem) board.Store { return failingDetach{m} }, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			srv := New(tc.store(newMem()), dir, "")
+			cookie := signUp(t, srv, "ada@example.com")
+			userID := currentUserID(t, srv, cookie)
+			job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+			if tc.blockRename {
+				if err := os.MkdirAll(filepath.Join(dir, userID, job.ID, "body"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			res := postFile(t, srv, cookie, job.ID, "brochure.txt", []byte("Two bedrooms\n"), "text/plain")
+			if res.Code != http.StatusInternalServerError {
+				t.Fatalf("status %d, want 500: %s", res.Code, res.Body.String())
+			}
+			if got := decodeError(t, res); got != "Could not store the brochure" {
+				t.Fatalf("error %q", got)
+			}
+			if files := filesUnder(t, dir); len(files) != 0 {
+				t.Fatalf("files left under DATA_DIR: %v", files)
+			}
+		})
+	}
+}
+
+func TestAttachSurvivesAClientThatHangsUp(t *testing.T) {
+	dir := t.TempDir()
+	srv := New(cancelAware{newMem()}, dir, "")
+	cookie := signUp(t, srv, "ada@example.com")
+	userID := currentUserID(t, srv, cookie)
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	body, formType := multipartBody(t, filePart("brochure.txt", []byte("Two bedrooms\n")))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/api/jobs/"+job.ID+"/file", body).WithContext(ctx)
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+	req.Header.Set("Content-Type", formType)
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", res.Code, res.Body.String())
+	}
+	assertBrochure(t, srv, cookie, dir, userID, job.ID, "brochure.txt", "Two bedrooms\n")
+}
+
+// cancelAware fails the claim on a cancelled context, as a database driver does.
+type cancelAware struct{ *mem }
+
+func (c cancelAware) AttachBrochure(ctx context.Context, id, userID, filename string) (board.Job, error) {
+	if err := ctx.Err(); err != nil {
+		return board.Job{}, err
+	}
+	return c.mem.AttachBrochure(ctx, id, userID, filename)
+}
+
+type failingAttach struct{ *mem }
+
+func (failingAttach) AttachBrochure(context.Context, string, string, string) (board.Job, error) {
+	return board.Job{}, errors.New("connection reset by peer")
+}
+
+type failingDetach struct{ *mem }
+
+func (failingDetach) DetachBrochure(context.Context, string, string) error {
+	return errors.New("connection reset by peer")
+}
+
+func TestAttachDoesNotUndoAConcurrentStart(t *testing.T) {
+	srv, dir := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	userID := currentUserID(t, srv, cookie)
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	release := make(chan struct{})
+	buf, formType := multipartBody(t, filePart("a.txt", []byte("Brochure A\n")))
+	slow := newGatedBody(buf.Bytes(), release)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/file", cookie, slow, formType)
+	}()
+	slow.waitStarted(t)
+
+	uploadFile(t, srv, cookie, job.ID, "b.txt", []byte("Brochure B\n"), "text/plain")
+	started := decodeJob(t, call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, ""))
+	if started.Status != "running" || started.RunID == "" {
+		t.Fatalf("start: status %s runId %q, want running", started.Status, started.RunID)
+	}
+	close(release)
+
+	res := <-done
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("slow upload: status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := decodeError(t, res); got != "A brochure is already attached" {
+		t.Fatalf("slow upload: error %q", got)
+	}
+	got := getSheet(t, srv, cookie, job.ID)
+	if got.Status != "running" || got.RunID != started.RunID {
+		t.Fatalf("status %s runId %q, want running %q", got.Status, got.RunID, started.RunID)
+	}
+	assertBrochure(t, srv, cookie, dir, userID, job.ID, "b.txt", "Brochure B\n")
+}
+
+func TestStartAnswersABrochureDetachedMeanwhile(t *testing.T) {
+	srv := New(detachBeforeStart{newMem()}, t.TempDir(), "")
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := decodeError(t, res); got != "Attach a brochure first" {
+		t.Fatalf("error %q", got)
+	}
+	if got := getSheet(t, srv, cookie, job.ID); got.Status != "draft" || got.RunID != "" {
+		t.Fatalf("status %s runId %q, want an untouched draft", got.Status, got.RunID)
+	}
+}
+
+// detachBeforeStart resets the brochure between the start handler's check
+// and the store's UPDATE, as a failed rename of a concurrent upload would.
+type detachBeforeStart struct{ *mem }
+
+func (d detachBeforeStart) StartJob(ctx context.Context, id, userID, runID string) (board.Job, error) {
+	job, err := d.JobForUser(ctx, id, userID)
+	if err != nil {
+		return board.Job{}, err
+	}
+	if err := d.DetachBrochure(ctx, id, job.Filename); err != nil {
+		return board.Job{}, err
+	}
+	return d.mem.StartJob(ctx, id, userID, runID)
+}
+
+func TestDownloadSetsSafeHeaders(t *testing.T) {
+	cases := []struct {
+		name        string
+		filename    string
+		data        []byte
+		onDisk      []byte
+		contentType string
+	}{
+		{"pdf", `Квартира "Loft" №1.pdf`, []byte("%PDF-1.4\n"), nil, "application/pdf"},
+		{"text", `notes "final".txt`, []byte("Two bedrooms\n"), nil, "text/plain; charset=utf-8"},
+		{"bytes that are neither", "brochure.txt", []byte("Two bedrooms\n"), []byte("\xff\xfe"), "application/octet-stream"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, dir := newTestServer(t)
+			cookie := signUp(t, srv, "ada@example.com")
+			userID := currentUserID(t, srv, cookie)
+			job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+			disposition := mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": tc.filename})
+			body, formType := multipartBody(t, formPart{disposition: disposition, data: tc.data})
+			if res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/file", cookie, body, formType); res.Code != http.StatusOK {
+				t.Fatalf("upload %d: %s", res.Code, res.Body.String())
+			}
+			bodyPath := filepath.Join(dir, userID, job.ID, "body")
+			want := tc.data
+			if tc.onDisk != nil {
+				want = tc.onDisk
+				if err := os.WriteFile(bodyPath, tc.onDisk, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			modTime := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+			if err := os.Chtimes(bodyPath, modTime, modTime); err != nil {
+				t.Fatal(err)
+			}
+
+			res := call(srv, http.MethodGet, "/api/jobs/"+job.ID+"/file", cookie, nil, "")
+			if res.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", res.Code, res.Body.String())
+			}
+			if got := res.Header().Get("Content-Type"); got != tc.contentType {
+				t.Fatalf("Content-Type %q, want %q", got, tc.contentType)
+			}
+			if got := res.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Fatalf("X-Content-Type-Options %q, want nosniff", got)
+			}
+			if got, want := res.Header().Get("Last-Modified"), modTime.Format(http.TimeFormat); got != want {
+				t.Fatalf("Last-Modified %q, want the file's %q", got, want)
+			}
+			kind, params, err := mime.ParseMediaType(res.Header().Get("Content-Disposition"))
+			if err != nil || kind != "attachment" || params["filename"] != tc.filename {
+				t.Fatalf("Content-Disposition %q parses to %q %q (%v), want attachment %q",
+					res.Header().Get("Content-Disposition"), kind, params["filename"], err, tc.filename)
+			}
+			if !bytes.Equal(res.Body.Bytes(), want) {
+				t.Fatalf("downloaded %q, want %q", res.Body.Bytes(), want)
+			}
+		})
+	}
+}
+
+func TestDownloadWithoutABrochureIsNotFound(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	res := call(srv, http.MethodGet, "/api/jobs/"+job.ID+"/file", cookie, nil, "")
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404: %s", res.Code, res.Body.String())
+	}
+	if got := decodeError(t, res); got != "Not found" {
+		t.Fatalf("error %q", got)
+	}
+}
+
 func TestDownloadReturnsTheStoredBrochure(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -519,6 +844,59 @@ func TestDownloadReturnsTheStoredBrochure(t *testing.T) {
 				t.Fatalf("after removing body: status %d, want 404", res.Code)
 			}
 		})
+	}
+}
+
+// gatedBody is a request body that closes started on its first Read, which
+// the upload handler reaches only after its early checks, and then blocks
+// until release is closed.
+type gatedBody struct {
+	r       io.Reader
+	once    sync.Once
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func newGatedBody(data []byte, release <-chan struct{}) *gatedBody {
+	return &gatedBody{r: bytes.NewReader(data), started: make(chan struct{}), release: release}
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return b.r.Read(p)
+}
+
+func (b *gatedBody) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-b.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the upload never started reading its body")
+	}
+}
+
+func getSheet(t *testing.T, srv *Server, cookie, id string) board.Job {
+	t.Helper()
+	res := call(srv, http.MethodGet, "/api/jobs/"+id, cookie, nil, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("get sheet %d: %s", res.Code, res.Body.String())
+	}
+	return decodeJob(t, res)
+}
+
+// assertBrochure checks the sheet's filename and the bytes in its body file.
+func assertBrochure(t *testing.T, srv *Server, cookie, dir, userID, jobID, filename, data string) {
+	t.Helper()
+	if got := getSheet(t, srv, cookie, jobID); got.Filename != filename {
+		t.Fatalf("filename %q, want %q", got.Filename, filename)
+	}
+	stored, err := os.ReadFile(filepath.Join(dir, userID, jobID, "body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stored) != data {
+		t.Fatalf("body %q, want %q", stored, data)
 	}
 }
 
@@ -586,12 +964,14 @@ func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte,
 
 func postFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) *httptest.ResponseRecorder {
 	t.Helper()
-	body, formType := multipartBody(t, formPart{
-		disposition: fmt.Sprintf(`form-data; name="file"; filename="%s"`, name),
-		contentType: contentType,
-		data:        data,
-	})
+	part := filePart(name, data)
+	part.contentType = contentType
+	body, formType := multipartBody(t, part)
 	return call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, body, formType)
+}
+
+func filePart(name string, data []byte) formPart {
+	return formPart{disposition: fmt.Sprintf(`form-data; name="file"; filename="%s"`, name), data: data}
 }
 
 type formPart struct {
@@ -793,13 +1173,32 @@ func (m *mem) JobForUser(_ context.Context, id, userID string) (board.Job, error
 	return cloneJob(job), nil
 }
 
-func (m *mem) UpdateJob(_ context.Context, job board.Job) error {
+func (m *mem) AttachBrochure(_ context.Context, id, userID, filename string) (board.Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.jobs[job.ID]; !ok {
-		return board.ErrNotFound
+	job, ok := m.jobs[id]
+	if !ok || job.UserID != userID {
+		return board.Job{}, board.ErrNotFound
 	}
-	m.jobs[job.ID] = cloneJob(job)
+	if job.Filename != "" {
+		return board.Job{}, board.ErrBrochureAttached
+	}
+	job.Filename = filename
+	job.UpdatedAt = time.Now().UTC()
+	m.jobs[id] = job
+	return cloneJob(job), nil
+}
+
+func (m *mem) DetachBrochure(_ context.Context, id, filename string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.jobs[id]
+	if !ok || job.Filename != filename || job.Status != "draft" {
+		return nil
+	}
+	job.Filename = ""
+	job.UpdatedAt = time.Now().UTC()
+	m.jobs[id] = job
 	return nil
 }
 
@@ -810,7 +1209,7 @@ func (m *mem) StartJob(_ context.Context, id, userID, runID string) (board.Job, 
 	if !ok || job.UserID != userID {
 		return board.Job{}, board.ErrNotFound
 	}
-	if job.Status != "draft" {
+	if job.Status != "draft" || job.Filename == "" {
 		return cloneJob(job), nil
 	}
 	for _, other := range m.jobs {

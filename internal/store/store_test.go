@@ -164,20 +164,133 @@ func TestStartJobLeavesAFinishedSheetUnchanged(t *testing.T) {
 		t.Run(status, func(t *testing.T) {
 			ada := newUser(t, s)
 			job := newDraft(t, s, ada.ID)
-			job.Status = status
-			job.RunID = board.NewID()
-			if err := s.UpdateJob(ctx, job); err != nil {
-				t.Fatal(err)
-			}
+			runID := board.NewID()
+			setStatus(t, s, job.ID, status, runID)
 
 			got, err := s.StartJob(ctx, job.ID, ada.ID, board.NewID())
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got.Status != status || got.RunID != job.RunID {
-				t.Fatalf("status %s runId %q, want %s %q", got.Status, got.RunID, status, job.RunID)
+			if got.Status != status || got.RunID != runID {
+				t.Fatalf("status %s runId %q, want %s %q", got.Status, got.RunID, status, runID)
 			}
 		})
+	}
+}
+
+func TestStartJobNeedsABrochure(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	ada := newUser(t, s)
+	job := newDraftWith(t, s, ada.ID, "")
+
+	got, err := s.StartJob(ctx, job.ID, ada.ID, board.NewID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "draft" || got.RunID != "" {
+		t.Fatalf("status %s runId %q, want an untouched draft", got.Status, got.RunID)
+	}
+}
+
+func TestAttachBrochureClaimsTheSlotOnce(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	ada := newUser(t, s)
+	grace := newUser(t, s)
+	job := newDraftWith(t, s, ada.ID, "")
+
+	if _, err := s.AttachBrochure(ctx, job.ID, grace.ID, "theirs.pdf"); !errors.Is(err, board.ErrNotFound) {
+		t.Fatalf("another account: err %v, want ErrNotFound", err)
+	}
+	got, err := s.AttachBrochure(ctx, job.ID, ada.ID, " brochure.pdf ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Filename != " brochure.pdf " {
+		t.Fatalf("filename %q, want the raw name", got.Filename)
+	}
+	if _, err := s.AttachBrochure(ctx, job.ID, ada.ID, "second.pdf"); !errors.Is(err, board.ErrBrochureAttached) {
+		t.Fatalf("second attach: err %v, want ErrBrochureAttached", err)
+	}
+	stored, err := s.JobForUser(ctx, job.ID, ada.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Filename != " brochure.pdf " {
+		t.Fatalf("stored filename %q, want the first one", stored.Filename)
+	}
+}
+
+func TestAttachBrochureConcurrentCallsHaveOneWinner(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	ada := newUser(t, s)
+	job := newDraftWith(t, s, ada.ID, "")
+
+	const n = 5
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = s.AttachBrochure(ctx, job.ID, ada.ID, fmt.Sprintf("brochure-%d.pdf", i))
+		}()
+	}
+	wg.Wait()
+
+	winner := -1
+	for i, err := range errs {
+		switch {
+		case err == nil && winner == -1:
+			winner = i
+		case err == nil:
+			t.Fatalf("attach %d and %d both won", winner, i)
+		case !errors.Is(err, board.ErrBrochureAttached):
+			t.Fatalf("attach %d: %v", i, err)
+		}
+	}
+	if winner == -1 {
+		t.Fatal("no attach won")
+	}
+	stored, err := s.JobForUser(ctx, job.ID, ada.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("brochure-%d.pdf", winner); stored.Filename != want {
+		t.Fatalf("stored filename %q, want the winner's %q", stored.Filename, want)
+	}
+}
+
+func TestDetachBrochureResetsOnlyAMatchingDraft(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	ada := newUser(t, s)
+
+	draft := newDraftWith(t, s, ada.ID, "brochure.pdf")
+	if err := s.DetachBrochure(ctx, draft.ID, "other.pdf"); err != nil {
+		t.Fatal(err)
+	}
+	if got := filenameOf(t, s, draft.ID, ada.ID); got != "brochure.pdf" {
+		t.Fatalf("another filename: filename %q, want it kept", got)
+	}
+	if err := s.DetachBrochure(ctx, draft.ID, "brochure.pdf"); err != nil {
+		t.Fatal(err)
+	}
+	if got := filenameOf(t, s, draft.ID, ada.ID); got != "" {
+		t.Fatalf("matching draft: filename %q, want it reset", got)
+	}
+
+	running := newDraftWith(t, s, ada.ID, "brochure.pdf")
+	if _, err := s.StartJob(ctx, running.ID, ada.ID, board.NewID()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DetachBrochure(ctx, running.ID, "brochure.pdf"); err != nil {
+		t.Fatal(err)
+	}
+	if got := filenameOf(t, s, running.ID, ada.ID); got != "brochure.pdf" {
+		t.Fatalf("running sheet: filename %q, want it kept", got)
 	}
 }
 
@@ -224,6 +337,11 @@ func newUser(t *testing.T, s *Store) board.User {
 
 func newDraft(t *testing.T, s *Store, userID string) board.Job {
 	t.Helper()
+	return newDraftWith(t, s, userID, "brochure.pdf")
+}
+
+func newDraftWith(t *testing.T, s *Store, userID, filename string) board.Job {
+	t.Helper()
 	now := time.Now().UTC()
 	job := board.Job{
 		ID:        board.NewID(),
@@ -231,7 +349,7 @@ func newDraft(t *testing.T, s *Store, userID string) board.Job {
 		Title:     "Market loft",
 		Address:   "10 Market Street",
 		Status:    "draft",
-		Filename:  "brochure.pdf",
+		Filename:  filename,
 		Checklist: board.NewChecklist(),
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -240,4 +358,23 @@ func newDraft(t *testing.T, s *Store, userID string) board.Job {
 		t.Fatal(err)
 	}
 	return job
+}
+
+func filenameOf(t *testing.T, s *Store, id, userID string) string {
+	t.Helper()
+	job, err := s.JobForUser(context.Background(), id, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return job.Filename
+}
+
+// setStatus stands in for the worker, which is the only writer of final statuses.
+func setStatus(t *testing.T, s *Store, id, status, runID string) {
+	t.Helper()
+	_, err := s.db.ExecContext(context.Background(),
+		`UPDATE jobs SET status = $1, run_id = $2 WHERE id = $3`, status, runID, id)
+	if err != nil {
+		t.Fatal(err)
+	}
 }

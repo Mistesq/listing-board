@@ -18,6 +18,8 @@ var (
 	ErrNotFound       = errors.New("not found")
 	ErrDuplicate      = errors.New("duplicate")
 	ErrAlreadyRunning = errors.New("another sheet is already running")
+	// ErrBrochureAttached means the sheet already has a brochure.
+	ErrBrochureAttached = errors.New("a brochure is already attached")
 )
 
 type User struct {
@@ -98,8 +100,13 @@ type Store interface {
 	ListJobs(ctx context.Context, userID string) ([]Job, error)
 	CreateJob(ctx context.Context, job Job) error
 	JobForUser(ctx context.Context, id, userID string) (Job, error)
-	UpdateJob(ctx context.Context, job Job) error
-	// StartJob moves a draft to running with runID. Any other status is
-	// returned unchanged, so a sheet gets its runID exactly once.
+	// AttachBrochure sets filename on a sheet that has none yet, so only one
+	// upload wins. A sheet that already has one gives ErrBrochureAttached.
+	AttachBrochure(ctx context.Context, id, userID, filename string) (Job, error)
+	// DetachBrochure undoes AttachBrochure after the file could not be stored,
+	// but only on a draft that still holds that filename.
+	DetachBrochure(ctx context.Context, id, filename string) error
+	// StartJob moves a draft with a brochure to running with runID. Any other
+	// sheet is returned unchanged, so a sheet gets its runID exactly once.
 	StartJob(ctx context.Context, id, userID, runID string) (Job, error)
 }

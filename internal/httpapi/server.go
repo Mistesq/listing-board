@@ -1,9 +1,12 @@
 package httpapi
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -225,6 +228,10 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if job.Filename != "" {
+		writeErr(w, http.StatusBadRequest, "A brochure is already attached")
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, board.MaxBrochureSize+64<<10)
 	name, data, problem := readBrochure(r)
 	if problem != "" {
@@ -235,22 +242,64 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Brochure must be a PDF or a text file")
 		return
 	}
-	dst := board.BrochurePath(s.dataDir, user.ID, job.ID)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
+	job, err := s.storeBrochure(r.Context(), user.ID, job.ID, name, data)
+	if errors.Is(err, board.ErrBrochureAttached) {
+		writeErr(w, http.StatusBadRequest, "A brochure is already attached")
 		return
 	}
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
-		return
-	}
-	job.Filename = name
-	job.UpdatedAt = time.Now().UTC()
-	if err := s.store.UpdateJob(r.Context(), job); err != nil {
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// storeBrochure writes data next to body, claims the sheet's brochure slot,
+// and only then renames the file into place, so a losing upload never touches
+// the winner's body. No temp file is left behind on any path.
+func (s *Server) storeBrochure(ctx context.Context, userID, jobID, name string, data []byte) (board.Job, error) {
+	dst := board.BrochurePath(s.dataDir, userID, jobID)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return board.Job{}, err
+	}
+	tmp, err := writeTemp(filepath.Dir(dst), data)
+	if err != nil {
+		return board.Job{}, err
+	}
+	// A client that hangs up must not cut the claim or the reset short.
+	ctx = context.WithoutCancel(ctx)
+	job, err := s.store.AttachBrochure(ctx, jobID, userID, name)
+	if err != nil {
+		os.Remove(tmp)
+		return board.Job{}, err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		if derr := s.store.DetachBrochure(ctx, jobID, name); derr != nil {
+			log.Printf("detach brochure of sheet %s: %v", jobID, derr)
+		}
+		return board.Job{}, err
+	}
+	return job, nil
+}
+
+func writeTemp(dir string, data []byte) (string, error) {
+	f, err := os.CreateTemp(dir, "body-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Chmod(0o644)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
@@ -275,6 +324,11 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Could not start the sheet")
 		return
 	}
+	if job.Status == "draft" {
+		// The brochure was detached after the check above.
+		writeErr(w, http.StatusBadRequest, "Attach a brochure first")
+		return
+	}
 	writeJSON(w, http.StatusOK, job)
 }
 
@@ -291,14 +345,35 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
-	f, err := os.Open(board.BrochurePath(s.dataDir, user.ID, job.ID))
+	data, modTime, err := readFile(board.BrochurePath(s.dataDir, user.ID, job.ID))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
+	contentType, ok := board.BrochureType(data)
+	if !ok {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": job.Filename}))
+	http.ServeContent(w, r, "", modTime, bytes.NewReader(data))
+}
+
+// readFile returns the file's bytes and its modification time, which is what
+// Last-Modified describes, not the sheet row.
+func readFile(path string) ([]byte, time.Time, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
 	defer f.Close()
-	w.Header().Set("Content-Disposition", "attachment; filename="+strconvQuote(filepath.Base(job.Filename)))
-	http.ServeContent(w, r, filepath.Base(job.Filename), job.UpdatedAt, f)
+	info, err := f.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	data, err := io.ReadAll(f)
+	return data, info.ModTime(), err
 }
 
 func (s *Server) load(w http.ResponseWriter, r *http.Request, userID string) (board.Job, bool) {
@@ -363,7 +438,7 @@ func readBrochure(r *http.Request) (string, []byte, string) {
 			continue
 		}
 		name := partFilename(part)
-		if name == "" {
+		if strings.TrimSpace(name) == "" {
 			return "", nil, "Choose a brochure file"
 		}
 		if len(name) > maxFilenameBytes || !utf8.ValidString(name) {
@@ -395,7 +470,7 @@ func partFilename(part *multipart.Part) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(params["filename"])
+	return params["filename"]
 }
 
 func decode(w http.ResponseWriter, r *http.Request, dst any) error {
@@ -411,11 +486,6 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeErr(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
-}
-
-func strconvQuote(value string) string {
-	b, _ := json.Marshal(value)
-	return string(b)
 }
 
 func withCORS(next http.Handler) http.Handler {

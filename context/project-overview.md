@@ -133,8 +133,18 @@ See Commands in `CLAUDE.md`. `go test ./...` uses an in-memory fake store and `t
 - Page refresh: the page polls `GET /api/jobs/{id}` about once a second while the open sheet is `running`, and updates the list entry from the response. No SSE. Alt: SSE.
 - `STEP_PAUSE`: unset means `2s`, `0` is allowed, an unparsable or negative value makes the worker exit at startup with a clear error. Alt: fall back to `2s`.
 - Check order on id routes: 401, then 404 (unknown or another account's sheet), then route checks. For start: 400 without a brochure, then status logic, then 409.
-- Error texts not fixed by README: existing texts in the code stay as they are (missing `file` field `Choose a brochure file`, wrong or empty type `Brochure must be a PDF or a text file`, oversized file `Brochure is too large`, broken multipart `Brochure upload was incomplete`, disk/store failure `Could not store the brochure`). New texts only for new cases: 409 on start `Another sheet is already running`; second upload `A brochure is already attached`.
-- Filename check: a client filename that is not valid UTF-8 or is longer than 255 bytes (after trimming spaces) gives 400 `Brochure file name is not valid`, checked before anything is written under `DATA_DIR`, so Postgres never sees it and no orphan `body` is left. Alt: reuse `Choose a brochure file`.
+- Error texts not fixed by README: existing texts in the code stay as they are (missing `file` field `Choose a brochure file`, wrong or empty type `Brochure must be a PDF or a text file`, oversized file `Brochure is too large`, broken multipart `Brochure upload was incomplete`, disk/store failure `Could not store the brochure`). New texts only for new cases: 409 on start `Another sheet is already running`; second upload `A brochure is already attached`; invalid client filename `Brochure file name is not valid`.
+- Filename check: a client filename that is not valid UTF-8 or is longer than 255 bytes (counted on the raw name, stored as sent) gives 400 `Brochure file name is not valid`, checked before anything is written under `DATA_DIR`, so Postgres never sees it and no orphan `body` is left. Alt: reuse `Choose a brochure file`.
+
+## Known trade-offs
+
+Accepted on purpose; each goes into `NOTES.md`.
+
+- Claim/rename window: upload claims the slot in the database (`filename` set) before it renames the temp file to `body`. A start that lands in that short window lets the worker find no file and fail the sheet with `Brochure is missing`. A normal user cannot hit this, because the upload response arrives only after the rename. Not made more complex.
+- Separate `SELECT` after the `UPDATE` in `StartJob`: the conditional `UPDATE` chooses `runId` once, then `JobForUser` re-reads the sheet in a second round trip instead of `UPDATE ... RETURNING`. The response can already show a later write (e.g. a worker step), and a re-read that fails after a committed start gives 500, while a retry returns the `running` sheet with 200. Left as it is.
+- Lost database connection in the middle of the `UPDATE` in `AttachBrochure`: the outcome is unknown (the claim may be committed), the upload removes its temp file and answers 500, so the sheet can be left with `filename` and no `body`. `AttachBrochure` is a single `UPDATE ... RETURNING` called with `context.WithoutCancel`, so a client hanging up does not cause this; only a broken database connection does. Not reset blindly, because `DetachBrochure` matches on `filename`, which is not unique per request.
+- Temp files before the claim: every concurrent upload to a sheet writes its validated bytes (up to 1 MiB) to its own `body-*.tmp` before the claim decides the winner; losers remove theirs.
+- Stale `body-*.tmp` after a crash: a process killed between writing the temp file and the rename leaves it behind, and nothing sweeps them.
 
 ## Open Questions
 

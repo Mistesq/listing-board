@@ -133,34 +133,39 @@ func (s *Store) JobForUser(ctx context.Context, id, userID string) (board.Job, e
 	return job, mapNotFound(err)
 }
 
-func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
-	raw, err := json.Marshal(job.Checklist)
-	if err != nil {
-		return err
-	}
-	res, err := s.db.ExecContext(ctx, `
+// AttachBrochure claims and returns the sheet in one statement, so no second
+// query can fail after the claim is committed.
+func (s *Store) AttachBrochure(ctx context.Context, id, userID, filename string) (board.Job, error) {
+	row := s.db.QueryRowContext(ctx, `
 		UPDATE jobs
-		SET status = $1, error = $2, run_id = $3, filename = $4, checklist = $5, updated_at = $6
-		WHERE id = $7
-	`, job.Status, job.Error, job.RunID, job.Filename, string(raw), job.UpdatedAt.UTC(), job.ID)
-	if err != nil {
-		return err
+		SET filename = $1, updated_at = $2
+		WHERE id = $3 AND user_id = $4 AND filename = ''
+		RETURNING `+jobColumns, filename, time.Now().UTC(), id, userID)
+	job, err := scanJob(row)
+	if !errors.Is(err, sql.ErrNoRows) {
+		return job, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
+	// No row changed: tell an unknown sheet from one that has a brochure.
+	if _, err := s.JobForUser(ctx, id, userID); err != nil {
+		return board.Job{}, err
 	}
-	if n == 0 {
-		return board.ErrNotFound
-	}
-	return nil
+	return board.Job{}, board.ErrBrochureAttached
+}
+
+func (s *Store) DetachBrochure(ctx context.Context, id, filename string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE jobs
+		SET filename = '', updated_at = $1
+		WHERE id = $2 AND filename = $3 AND status = 'draft'
+	`, time.Now().UTC(), id, filename)
+	return err
 }
 
 func (s *Store) StartJob(ctx context.Context, id, userID, runID string) (board.Job, error) {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE jobs
 		SET status = 'running', run_id = $1, updated_at = $2
-		WHERE id = $3 AND user_id = $4 AND status = 'draft'
+		WHERE id = $3 AND user_id = $4 AND status = 'draft' AND filename <> ''
 	`, runID, time.Now().UTC(), id, userID)
 	if isConstraint(err, runningIndex) {
 		return board.Job{}, board.ErrAlreadyRunning
@@ -173,8 +178,10 @@ func (s *Store) StartJob(ctx context.Context, id, userID, runID string) (board.J
 
 const runningIndex = "jobs_one_running_per_user"
 
+const jobColumns = `id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at`
+
 const jobSelect = `
-	SELECT id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at
+	SELECT ` + jobColumns + `
 	FROM jobs`
 
 type scanner interface {
