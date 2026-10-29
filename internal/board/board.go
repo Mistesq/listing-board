@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	ErrNotFound  = errors.New("not found")
-	ErrDuplicate = errors.New("duplicate")
+	ErrNotFound       = errors.New("not found")
+	ErrDuplicate      = errors.New("duplicate")
+	ErrAlreadyRunning = errors.New("another sheet is already running")
 )
 
 type User struct {
@@ -73,4 +74,7 @@ type Store interface {
 	CreateJob(ctx context.Context, job Job) error
 	JobForUser(ctx context.Context, id, userID string) (Job, error)
 	UpdateJob(ctx context.Context, job Job) error
+	// StartJob moves a draft to running with runID. Any other status is
+	// returned unchanged, so a sheet gets its runID exactly once.
+	StartJob(ctx context.Context, id, userID, runID string) (Job, error)
 }

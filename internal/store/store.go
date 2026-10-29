@@ -156,6 +156,23 @@ func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
 	return nil
 }
 
+func (s *Store) StartJob(ctx context.Context, id, userID, runID string) (board.Job, error) {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE jobs
+		SET status = 'running', run_id = $1, updated_at = $2
+		WHERE id = $3 AND user_id = $4 AND status = 'draft'
+	`, runID, time.Now().UTC(), id, userID)
+	if isConstraint(err, runningIndex) {
+		return board.Job{}, board.ErrAlreadyRunning
+	}
+	if err != nil {
+		return board.Job{}, err
+	}
+	return s.JobForUser(ctx, id, userID)
+}
+
+const runningIndex = "jobs_one_running_per_user"
+
 const jobSelect = `
 	SELECT id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at
 	FROM jobs`
@@ -193,4 +210,9 @@ func mapNotFound(err error) error {
 func isUnique(err error) bool {
 	var pg *pgconn.PgError
 	return errors.As(err, &pg) && pg.Code == "23505"
+}
+
+func isConstraint(err error, name string) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "23505" && pg.ConstraintName == name
 }

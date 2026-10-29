@@ -277,14 +277,12 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Attach a brochure first")
 		return
 	}
-	job.Status = "success"
-	job.RunID = board.NewID()
-	job.Error = ""
-	for i := range job.Checklist {
-		job.Checklist[i].State = "done"
+	job, err := s.store.StartJob(r.Context(), job.ID, user.ID, board.NewID())
+	if errors.Is(err, board.ErrAlreadyRunning) {
+		writeErr(w, http.StatusConflict, "Another sheet is already running")
+		return
 	}
-	job.UpdatedAt = time.Now().UTC()
-	if err := s.store.UpdateJob(r.Context(), job); err != nil {
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not start the sheet")
 		return
 	}

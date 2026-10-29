@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -31,16 +32,27 @@ func TestStartMarksTheJobSuccessful(t *testing.T) {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 	got := decodeJob(t, res)
-	if got.Status != "success" {
-		t.Fatalf("status %s, want success", got.Status)
+	if got.Status != "running" {
+		t.Fatalf("status %s, want running", got.Status)
 	}
 	if got.RunID == "" {
 		t.Fatal("runId is empty")
 	}
+	if len(got.Checklist) != 3 {
+		t.Fatalf("checklist has %d steps, want 3", len(got.Checklist))
+	}
 	for _, step := range got.Checklist {
-		if step.State != "done" {
-			t.Fatalf("step %q is %s", step.Label, step.State)
+		if step.State != "pending" {
+			t.Fatalf("step %q is %s, want pending", step.Label, step.State)
 		}
+	}
+
+	again := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	if again.Code != http.StatusOK {
+		t.Fatalf("second start: status %d: %s", again.Code, again.Body.String())
+	}
+	if second := decodeJob(t, again); second.Status != "running" || second.RunID != got.RunID {
+		t.Fatalf("second start: status %s runId %q, want running %q", second.Status, second.RunID, got.RunID)
 	}
 }
 
@@ -82,6 +94,151 @@ func TestStartRequiresASession(t *testing.T) {
 	res := call(srv, http.MethodPost, "/api/jobs/"+board.NewID()+"/start", "", nil, "")
 	if res.Code != http.StatusUnauthorized {
 		t.Fatalf("status %d, want 401", res.Code)
+	}
+}
+
+func TestStartRequiresABrochure(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := decodeError(t, res); got != "Attach a brochure first" {
+		t.Fatalf("error %q", got)
+	}
+}
+
+func TestStartRejectsASecondRunningSheet(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	first := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	second := createSheet(t, srv, cookie, "Harbour flat", "2 Harbour Road")
+	uploadFile(t, srv, cookie, first.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	uploadFile(t, srv, cookie, second.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	if res := call(srv, http.MethodPost, "/api/jobs/"+first.ID+"/start", cookie, nil, ""); res.Code != http.StatusOK {
+		t.Fatalf("first start: status %d: %s", res.Code, res.Body.String())
+	}
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+second.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusConflict {
+		t.Fatalf("status %d, want 409: %s", res.Code, res.Body.String())
+	}
+	if got := decodeError(t, res); got != "Another sheet is already running" {
+		t.Fatalf("error %q", got)
+	}
+	got := decodeJob(t, call(srv, http.MethodGet, "/api/jobs/"+second.ID, cookie, nil, ""))
+	if got.Status != "draft" || got.RunID != "" {
+		t.Fatalf("second sheet: status %s runId %q, want an untouched draft", got.Status, got.RunID)
+	}
+}
+
+func TestStartChecksTheBrochureBeforeTheRunningSheet(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	running := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, running.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	if res := call(srv, http.MethodPost, "/api/jobs/"+running.ID+"/start", cookie, nil, ""); res.Code != http.StatusOK {
+		t.Fatalf("first start: status %d: %s", res.Code, res.Body.String())
+	}
+	bare := createSheet(t, srv, cookie, "Harbour flat", "2 Harbour Road")
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+bare.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", res.Code, res.Body.String())
+	}
+	if got := decodeError(t, res); got != "Attach a brochure first" {
+		t.Fatalf("error %q", got)
+	}
+}
+
+func TestStartHidesAStoreFailure(t *testing.T) {
+	srv := New(failingStart{newMem()}, t.TempDir(), "")
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+	if res.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500: %s", res.Code, res.Body.String())
+	}
+	if got := decodeError(t, res); got != "Could not start the sheet" {
+		t.Fatalf("error %q", got)
+	}
+}
+
+type failingStart struct{ *mem }
+
+func (failingStart) StartJob(context.Context, string, string, string) (board.Job, error) {
+	return board.Job{}, errors.New("connection reset by peer")
+}
+
+func TestStartRunsSheetsOfDifferentAccountsAtOnce(t *testing.T) {
+	srv, _ := newTestServer(t)
+	for _, email := range []string{"ada@example.com", "grace@example.com"} {
+		cookie := signUp(t, srv, email)
+		job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+		uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+		if res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, ""); res.Code != http.StatusOK {
+			t.Fatalf("%s: status %d: %s", email, res.Code, res.Body.String())
+		}
+	}
+}
+
+func TestStartLeavesAFinishedSheetUnchanged(t *testing.T) {
+	for _, status := range []string{"success", "failed"} {
+		t.Run(status, func(t *testing.T) {
+			store := newMem()
+			srv := New(store, t.TempDir(), "")
+			cookie := signUp(t, srv, "ada@example.com")
+			job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+			uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+			started := decodeJob(t, call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, ""))
+			store.setStatus(job.ID, status)
+
+			res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+			if res.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", res.Code, res.Body.String())
+			}
+			if got := decodeJob(t, res); got.Status != status || got.RunID != started.RunID {
+				t.Fatalf("status %s runId %q, want %s %q", got.Status, got.RunID, status, started.RunID)
+			}
+		})
+	}
+}
+
+func TestConcurrentStartsChooseOneRunID(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cookie := signUp(t, srv, "ada@example.com")
+	job := createSheet(t, srv, cookie, "Market loft", "10 Market Street")
+	uploadFile(t, srv, cookie, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	const n = 10
+	results := make([]*httptest.ResponseRecorder, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/start", cookie, nil, "")
+		}()
+	}
+	wg.Wait()
+
+	var runID string
+	for i, res := range results {
+		if res.Code != http.StatusOK {
+			t.Fatalf("start %d: status %d: %s", i, res.Code, res.Body.String())
+		}
+		got := decodeJob(t, res)
+		if runID == "" {
+			runID = got.RunID
+		}
+		if got.RunID == "" || got.RunID != runID {
+			t.Fatalf("start %d: runId %q, want %q", i, got.RunID, runID)
+		}
 	}
 }
 
@@ -386,6 +543,37 @@ func (m *mem) UpdateJob(_ context.Context, job board.Job) error {
 	}
 	m.jobs[job.ID] = cloneJob(job)
 	return nil
+}
+
+func (m *mem) StartJob(_ context.Context, id, userID, runID string) (board.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.jobs[id]
+	if !ok || job.UserID != userID {
+		return board.Job{}, board.ErrNotFound
+	}
+	if job.Status != "draft" {
+		return cloneJob(job), nil
+	}
+	for _, other := range m.jobs {
+		if other.UserID == userID && other.Status == "running" {
+			return board.Job{}, board.ErrAlreadyRunning
+		}
+	}
+	job.Status = "running"
+	job.RunID = runID
+	job.UpdatedAt = time.Now().UTC()
+	m.jobs[id] = job
+	return cloneJob(job), nil
+}
+
+// setStatus stands in for the worker, which is the only writer of final statuses.
+func (m *mem) setStatus(id, status string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job := m.jobs[id]
+	job.Status = status
+	m.jobs[id] = job
 }
 
 func cloneJob(job board.Job) board.Job {
