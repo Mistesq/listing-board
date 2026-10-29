@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -294,6 +295,152 @@ func TestDetachBrochureResetsOnlyAMatchingDraft(t *testing.T) {
 	}
 }
 
+func TestListJobsShowsOnlyTheOwnersSheetsNewestFirst(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	ada := newUser(t, s)
+	grace := newUser(t, s)
+
+	empty, err := s.ListJobs(ctx, ada.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("no sheets: got %#v, want an empty non-nil slice", empty)
+	}
+
+	now := time.Now().UTC()
+	older := newDraftAt(t, s, ada.ID, now.Add(-time.Minute))
+	newer := newDraftAt(t, s, ada.ID, now)
+	newDraft(t, s, grace.ID)
+
+	jobs, err := s.ListJobs(ctx, ada.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 || jobs[0].ID != newer.ID || jobs[1].ID != older.ID {
+		t.Fatalf("got %d sheets, want ada's two, newest first", len(jobs))
+	}
+}
+
+func TestRunningJobsListsEveryAccount(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	ada := newUser(t, s)
+	grace := newUser(t, s)
+	adas := newRunning(t, s, ada.ID)
+	graces := newRunning(t, s, grace.ID)
+	draft := newDraft(t, s, ada.ID)
+
+	jobs, err := s.RunningJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]board.Job{}
+	for _, job := range jobs {
+		if job.Status != "running" {
+			t.Fatalf("sheet %s is %s, want only running sheets", job.ID, job.Status)
+		}
+		found[job.ID] = job
+	}
+	for _, want := range []board.Job{adas, graces} {
+		got, ok := found[want.ID]
+		if !ok {
+			t.Fatalf("running sheet %s is missing", want.ID)
+		}
+		if got.UserID != want.UserID || got.RunID != want.RunID || len(got.Checklist) != 3 {
+			t.Fatalf("sheet %s: user %q runId %q steps %d, want %q %q 3",
+				want.ID, got.UserID, got.RunID, len(got.Checklist), want.UserID, want.RunID)
+		}
+	}
+	if _, ok := found[draft.ID]; ok {
+		t.Fatal("a draft is listed as running")
+	}
+}
+
+func TestSaveChecklistNeedsTheCurrentRun(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	ada := newUser(t, s)
+	done := board.NewChecklist()
+	done[0].State = "done"
+
+	t.Run("current run", func(t *testing.T) {
+		job := newRunning(t, s, ada.ID)
+		ok, err := s.SaveChecklist(ctx, job.ID, job.RunID, job.Checklist, done)
+		if err != nil || !ok {
+			t.Fatalf("ok %v err %v, want a changed row", ok, err)
+		}
+		got := jobOf(t, s, job.ID, ada.ID)
+		if got.Status != "running" || got.RunID != job.RunID || got.Checklist[0].State != "done" {
+			t.Fatalf("status %s runId %q steps %+v, want running %q with step 1 done", got.Status, got.RunID, got.Checklist, job.RunID)
+		}
+	})
+	t.Run("old run", func(t *testing.T) {
+		job := newRunning(t, s, newUser(t, s).ID)
+		assertNoChange(t, s, job, func() (bool, error) {
+			return s.SaveChecklist(ctx, job.ID, board.NewID(), job.Checklist, done)
+		})
+	})
+	t.Run("stale checklist", func(t *testing.T) {
+		job := newRunning(t, s, newUser(t, s).ID)
+		stale := job.Checklist
+		job.Checklist = board.NewChecklist()
+		for i := range job.Checklist {
+			job.Checklist[i].State = "done"
+		}
+		if ok, err := s.SaveChecklist(ctx, job.ID, job.RunID, stale, job.Checklist); err != nil || !ok {
+			t.Fatalf("ok %v err %v, want a changed row", ok, err)
+		}
+		// A save from the all-pending snapshot would roll steps 2 and 3 back.
+		assertNoChange(t, s, job, func() (bool, error) {
+			return s.SaveChecklist(ctx, job.ID, job.RunID, stale, done)
+		})
+	})
+	for _, status := range []string{"draft", "success", "failed"} {
+		t.Run(status, func(t *testing.T) {
+			job := newRunning(t, s, newUser(t, s).ID)
+			setStatus(t, s, job.ID, status, job.RunID)
+			job.Status = status
+			assertNoChange(t, s, job, func() (bool, error) {
+				return s.SaveChecklist(ctx, job.ID, job.RunID, job.Checklist, done)
+			})
+		})
+	}
+}
+
+func TestFinishJobNeedsTheCurrentRun(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	for _, tc := range []struct{ status, message string }{
+		{"success", ""},
+		{"failed", "Brochure is missing"},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			ada := newUser(t, s)
+			job := newRunning(t, s, ada.ID)
+
+			assertNoChange(t, s, job, func() (bool, error) {
+				return s.FinishJob(ctx, job.ID, board.NewID(), tc.status, tc.message)
+			})
+			ok, err := s.FinishJob(ctx, job.ID, job.RunID, tc.status, tc.message)
+			if err != nil || !ok {
+				t.Fatalf("ok %v err %v, want a changed row", ok, err)
+			}
+			got := jobOf(t, s, job.ID, ada.ID)
+			if got.Status != tc.status || got.Error != tc.message || got.RunID != job.RunID {
+				t.Fatalf("status %s error %q runId %q, want %s %q %q", got.Status, got.Error, got.RunID, tc.status, tc.message, job.RunID)
+			}
+
+			// A finished sheet is final: a second write with the same run changes nothing.
+			job = got
+			assertNoChange(t, s, job, func() (bool, error) {
+				return s.FinishJob(ctx, job.ID, job.RunID, "running", "")
+			})
+		})
+	}
+}
+
 func TestIsConstraintTellsUniqueViolationsApart(t *testing.T) {
 	running := &pgconn.PgError{Code: "23505", ConstraintName: runningIndex}
 	cases := []struct {
@@ -342,7 +489,16 @@ func newDraft(t *testing.T, s *Store, userID string) board.Job {
 
 func newDraftWith(t *testing.T, s *Store, userID, filename string) board.Job {
 	t.Helper()
-	now := time.Now().UTC()
+	return createDraft(t, s, userID, filename, time.Now().UTC())
+}
+
+func newDraftAt(t *testing.T, s *Store, userID string, created time.Time) board.Job {
+	t.Helper()
+	return createDraft(t, s, userID, "brochure.pdf", created)
+}
+
+func createDraft(t *testing.T, s *Store, userID, filename string, now time.Time) board.Job {
+	t.Helper()
 	job := board.Job{
 		ID:        board.NewID(),
 		UserID:    userID,
@@ -362,11 +518,44 @@ func newDraftWith(t *testing.T, s *Store, userID, filename string) board.Job {
 
 func filenameOf(t *testing.T, s *Store, id, userID string) string {
 	t.Helper()
+	return jobOf(t, s, id, userID).Filename
+}
+
+func jobOf(t *testing.T, s *Store, id, userID string) board.Job {
+	t.Helper()
 	job, err := s.JobForUser(context.Background(), id, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return job.Filename
+	return job
+}
+
+func newRunning(t *testing.T, s *Store, userID string) board.Job {
+	t.Helper()
+	job := newDraft(t, s, userID)
+	started, err := s.StartJob(context.Background(), job.ID, userID, board.NewID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return started
+}
+
+// assertNoChange runs a conditional write that must not match and checks the
+// stored sheet kept its status, error, runId and checklist.
+func assertNoChange(t *testing.T, s *Store, job board.Job, write func() (bool, error)) {
+	t.Helper()
+	ok, err := write()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("write reported a changed row, want none")
+	}
+	got := jobOf(t, s, job.ID, job.UserID)
+	if got.Status != job.Status || got.Error != job.Error || got.RunID != job.RunID ||
+		!slices.Equal(got.Checklist, job.Checklist) {
+		t.Fatalf("sheet changed to %+v, want %+v", got, job)
+	}
 }
 
 // setStatus stands in for the worker, which is the only writer of final statuses.

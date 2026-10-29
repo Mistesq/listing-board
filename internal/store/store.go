@@ -95,7 +95,16 @@ func (s *Store) UserByToken(ctx context.Context, token string) (board.User, erro
 }
 
 func (s *Store) ListJobs(ctx context.Context, userID string) ([]board.Job, error) {
-	rows, err := s.db.QueryContext(ctx, jobSelect+` WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+	return s.queryJobs(ctx, jobSelect+` WHERE user_id = $1 ORDER BY created_at DESC`, userID)
+}
+
+// RunningJobs returns the running sheets of every account, for the worker.
+func (s *Store) RunningJobs(ctx context.Context) ([]board.Job, error) {
+	return s.queryJobs(ctx, jobSelect+` WHERE status = 'running' ORDER BY created_at`)
+}
+
+func (s *Store) queryJobs(ctx context.Context, query string, args ...any) ([]board.Job, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +183,45 @@ func (s *Store) StartJob(ctx context.Context, id, userID, runID string) (board.J
 		return board.Job{}, err
 	}
 	return s.JobForUser(ctx, id, userID)
+}
+
+// SaveChecklist replaces prev with next and reports false when the sheet is no
+// longer running under runID or its checklist is no longer prev, so a stale
+// snapshot never writes over a newer one.
+func (s *Store) SaveChecklist(ctx context.Context, id, runID string, prev, next []board.Step) (bool, error) {
+	rawPrev, err := json.Marshal(prev)
+	if err != nil {
+		return false, err
+	}
+	rawNext, err := json.Marshal(next)
+	if err != nil {
+		return false, err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE jobs
+		SET checklist = $1, updated_at = $2
+		WHERE id = $3 AND status = 'running' AND run_id = $4 AND checklist = $5
+	`, string(rawNext), time.Now().UTC(), id, runID, string(rawPrev))
+	return changed(res, err)
+}
+
+// FinishJob sets a final status and reports false when the sheet is no longer
+// running under runID.
+func (s *Store) FinishJob(ctx context.Context, id, runID, status, message string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE jobs
+		SET status = $1, error = $2, updated_at = $3
+		WHERE id = $4 AND status = 'running' AND run_id = $5
+	`, status, message, time.Now().UTC(), id, runID)
+	return changed(res, err)
+}
+
+func changed(res sql.Result, err error) (bool, error) {
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 const runningIndex = "jobs_one_running_per_user"
