@@ -201,10 +201,11 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user.ID)
 	if !ok {
 		return
 	}
@@ -212,10 +213,11 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user.ID)
 	if !ok {
 		return
 	}
@@ -263,10 +265,11 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user.ID)
 	if !ok {
 		return
 	}
@@ -289,10 +292,11 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user.ID)
 	if !ok {
 		return
 	}
@@ -310,8 +314,8 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, filepath.Base(job.Filename), job.UpdatedAt, f)
 }
 
-func (s *Server) load(w http.ResponseWriter, r *http.Request) (board.Job, bool) {
-	job, err := s.store.Job(r.Context(), r.PathValue("id"))
+func (s *Server) load(w http.ResponseWriter, r *http.Request, userID string) (board.Job, bool) {
+	job, err := s.store.JobForUser(r.Context(), r.PathValue("id"), userID)
 	if errors.Is(err, board.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return board.Job{}, false

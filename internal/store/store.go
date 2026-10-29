@@ -127,8 +127,8 @@ func (s *Store) CreateJob(ctx context.Context, job board.Job) error {
 	return err
 }
 
-func (s *Store) Job(ctx context.Context, id string) (board.Job, error) {
-	row := s.db.QueryRowContext(ctx, jobSelect+` WHERE id = $1`, id)
+func (s *Store) JobForUser(ctx context.Context, id, userID string) (board.Job, error) {
+	row := s.db.QueryRowContext(ctx, jobSelect+` WHERE id = $1 AND user_id = $2`, id, userID)
 	job, err := scanJob(row)
 	return job, mapNotFound(err)
 }

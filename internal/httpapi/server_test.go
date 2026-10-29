@@ -85,6 +85,118 @@ func TestStartRequiresASession(t *testing.T) {
 	}
 }
 
+func TestIDRoutesHideAnotherOwnersSheet(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ada := signUp(t, srv, "ada@example.com")
+	grace := signUp(t, srv, "grace@example.com")
+	job := createSheet(t, srv, ada, "Market loft", "10 Market Street")
+	uploadFile(t, srv, ada, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	for _, path := range []string{"/api/jobs/" + job.ID, "/api/jobs/" + job.ID + "/file"} {
+		if res := call(srv, http.MethodGet, path, ada, nil, ""); res.Code != http.StatusOK {
+			t.Fatalf("owner GET %s: status %d: %s", path, res.Code, res.Body.String())
+		}
+	}
+
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/jobs/" + job.ID},
+		{http.MethodPost, "/api/jobs/" + job.ID + "/file"},
+		{http.MethodPost, "/api/jobs/" + job.ID + "/start"},
+		{http.MethodGet, "/api/jobs/" + job.ID + "/file"},
+	}
+	sessions := []struct {
+		name    string
+		cookie  string
+		status  int
+		message string
+	}{
+		{"another account", grace, http.StatusNotFound, "Not found"},
+		{"no session", "", http.StatusUnauthorized, "Sign in"},
+	}
+	for _, session := range sessions {
+		for _, route := range routes {
+			t.Run(session.name+" "+route.method+" "+route.path, func(t *testing.T) {
+				res := call(srv, route.method, route.path, session.cookie, nil, "")
+				if res.Code != session.status {
+					t.Fatalf("status %d, want %d: %s", res.Code, session.status, res.Body.String())
+				}
+				if got := decodeError(t, res); got != session.message {
+					t.Fatalf("error %q, want %q", got, session.message)
+				}
+			})
+		}
+	}
+}
+
+func TestAnotherOwnersSheetLooksLikeAnUnknownOne(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ada := signUp(t, srv, "ada@example.com")
+	grace := signUp(t, srv, "grace@example.com")
+	job := createSheet(t, srv, ada, "Market loft", "10 Market Street")
+	uploadFile(t, srv, ada, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+	unknown := board.NewID()
+
+	routes := []struct {
+		method string
+		suffix string
+	}{
+		{http.MethodGet, ""},
+		{http.MethodPost, "/file"},
+		{http.MethodPost, "/start"},
+		{http.MethodGet, "/file"},
+	}
+	for _, route := range routes {
+		t.Run(route.method+" "+route.suffix, func(t *testing.T) {
+			theirs := call(srv, route.method, "/api/jobs/"+job.ID+route.suffix, grace, nil, "")
+			missing := call(srv, route.method, "/api/jobs/"+unknown+route.suffix, grace, nil, "")
+			if theirs.Code != missing.Code || theirs.Body.String() != missing.Body.String() {
+				t.Fatalf("another account's sheet: %d %q, unknown sheet: %d %q",
+					theirs.Code, theirs.Body.String(), missing.Code, missing.Body.String())
+			}
+		})
+	}
+}
+
+func TestUploadChecksTheOwnerBeforeReadingTheBody(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ada := signUp(t, srv, "ada@example.com")
+	grace := signUp(t, srv, "grace@example.com")
+	job := createSheet(t, srv, ada, "Market loft", "10 Market Street")
+
+	body := &readRecorder{r: strings.NewReader("--x\r\n")}
+	res := call(srv, http.MethodPost, "/api/jobs/"+job.ID+"/file", grace, body, "multipart/form-data; boundary=x")
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404: %s", res.Code, res.Body.String())
+	}
+	if body.read {
+		t.Fatal("the request body was read before the ownership check")
+	}
+}
+
+type readRecorder struct {
+	r    io.Reader
+	read bool
+}
+
+func (b *readRecorder) Read(p []byte) (int, error) {
+	b.read = true
+	return b.r.Read(p)
+}
+
+func decodeError(t *testing.T, res *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body %q: %v", res.Body.String(), err)
+	}
+	return body.Error
+}
+
 func newTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -256,11 +368,11 @@ func (m *mem) CreateJob(_ context.Context, job board.Job) error {
 	return nil
 }
 
-func (m *mem) Job(_ context.Context, id string) (board.Job, error) {
+func (m *mem) JobForUser(_ context.Context, id, userID string) (board.Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	job, ok := m.jobs[id]
-	if !ok {
+	if !ok || job.UserID != userID {
 		return board.Job{}, board.ErrNotFound
 	}
 	return cloneJob(job), nil
