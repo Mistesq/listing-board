@@ -441,7 +441,7 @@ func readBrochure(r *http.Request) (string, []byte, string) {
 		if strings.TrimSpace(name) == "" {
 			return "", nil, "Choose a brochure file"
 		}
-		if len(name) > maxFilenameBytes || !utf8.ValidString(name) {
+		if len(name) > maxFilenameBytes || !utf8.ValidString(name) || strings.ContainsRune(name, 0) {
 			return "", nil, "Brochure file name is not valid"
 		}
 		data, err := io.ReadAll(io.LimitReader(part, board.MaxBrochureSize+1))

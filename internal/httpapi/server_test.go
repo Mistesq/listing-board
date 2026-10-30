@@ -426,6 +426,9 @@ func TestUploadRejectsABrokenForm(t *testing.T) {
 		{"blank filename", func(t *testing.T) (io.Reader, string) {
 			return multipartBody(t, formPart{disposition: `form-data; name="file"; filename="  "`, data: []byte("Two bedrooms\n")})
 		}, "Choose a brochure file"},
+		{"filename with a NUL byte", func(t *testing.T) (io.Reader, string) {
+			return multipartBody(t, formPart{disposition: `form-data; name="file"; filename*=UTF-8''a%00b.txt`, data: []byte("Two bedrooms\n")})
+		}, "Brochure file name is not valid"},
 		{"cut before the closing boundary", func(t *testing.T) (io.Reader, string) {
 			buf, formType := multipartBody(t, file)
 			raw := buf.Bytes()
