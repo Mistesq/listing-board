@@ -31,12 +31,21 @@ header {
 }
 
 .layout {
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 280px minmax(0, 1fr);
+  align-items: start;
   margin-top: 28px;
 }
 
 .narrow {
   max-width: 420px;
+}
+
+.narrow form {
+  margin: 24px 0 16px;
+}
+
+form .error {
+  margin: 0;
 }
 
 .eyebrow {
@@ -81,6 +90,10 @@ button.row {
   text-align: left;
 }
 
+button.row > span:first-child {
+  overflow-wrap: anywhere;
+}
+
 button.row.on {
   background: #fff;
 }
@@ -97,6 +110,7 @@ button.row.on {
   background: #fff;
   border: 1px solid #d9d2c5;
   padding: 20px;
+  overflow-wrap: anywhere;
 }
 
 ol {
@@ -123,6 +137,6 @@ li.done {
 
 @media (max-width: 720px) {
   .layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
